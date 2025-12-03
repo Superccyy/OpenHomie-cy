@@ -1,33 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2021 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: BSD-3-Clause
-# 
-# Redistribution and use in source and binary forms, with or without
-# modification, are permitted provided that the following conditions are met:
-#
-# 1. Redistributions of source code must retain the above copyright notice, this
-# list of conditions and the following disclaimer.
-#
-# 2. Redistributions in binary form must reproduce the above copyright notice,
-# this list of conditions and the following disclaimer in the documentation
-# and/or other materials provided with the distribution.
-#
-# 3. Neither the name of the copyright holder nor the names of its
-# contributors may be used to endorse or promote products derived from
-# this software without specific prior written permission.
-#
-# THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
-# AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
-# IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
-# DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE
-# FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
-# DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR
-# SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER
-# CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,
-# OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
-# OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
-#
-# Copyright (c) 2021 ETH Zurich, Nikita Rudin
-
+# ... (版权信息省略) ...
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -36,24 +7,26 @@ from rsl_rl.modules import HIMActorCritic
 from rsl_rl.storage import HIMRolloutStorage
 
 class HIMPPO:
+    # 类型注解：actor_critic 必须是 HIMActorCritic 类的实例
     actor_critic: HIMActorCritic
+    
     def __init__(self,
                  actor_critic,
-                 use_flip = True,
-                 num_learning_epochs=1,
-                 num_mini_batches=1,
-                 clip_param=0.2,
-                 gamma=0.998,
-                 lam=0.95,
-                 value_loss_coef=1.0,
-                 entropy_coef=0.0,
-                 learning_rate=1e-3,
-                 max_grad_norm=1.0,
-                 use_clipped_value_loss=True,
-                 schedule="fixed",
-                 desired_kl=0.01,
-                 device='cpu',
-                 symmetry_scale=1e-3,
+                 use_flip = True,            # 是否启用镜像翻转（对称性利用的核心）
+                 num_learning_epochs=1,      # 每次更新循环的 epoch 数
+                 num_mini_batches=1,         # 每次更新的 mini-batch 数
+                 clip_param=0.2,             # PPO 的裁剪参数 epsilon
+                 gamma=0.998,                # 折扣因子
+                 lam=0.95,                   # GAE (Generalized Advantage Estimation) 参数
+                 value_loss_coef=1.0,        # 价值损失权重
+                 entropy_coef=0.0,           # 熵正则化权重
+                 learning_rate=1e-3,         # 学习率
+                 max_grad_norm=1.0,          # 梯度裁剪阈值
+                 use_clipped_value_loss=True,# 是否使用裁剪后的价值损失
+                 schedule="fixed",           # 学习率调度策略
+                 desired_kl=0.01,            # 目标 KL 散度 (用于自适应学习率)
+                 device='cpu',               # 运行设备 (cuda/cpu)
+                 symmetry_scale=1e-3,        # 对称性损失的权重系数 (重要参数!)
                  ):
 
         self.device = device
@@ -63,15 +36,18 @@ class HIMPPO:
         self.schedule = schedule
         self.learning_rate = learning_rate
 
-        # PPO components
+        # PPO 组件初始化
         self.actor_critic = actor_critic
         self.actor_critic.to(self.device)
-        self.storage = None # initialized later
+        self.storage = None # 数据存储器，稍后初始化
         self.optimizer = optim.Adam(self.actor_critic.parameters(), lr=learning_rate)
+        
+        # 两个 Transition 缓冲区：一个存原始数据，一个存镜像数据
         self.transition = HIMRolloutStorage.Transition()
         self.transition_sym = HIMRolloutStorage.Transition()
         self.symmetry_scale = symmetry_scale
-        # PPO parameters
+        
+        # PPO 参数保存
         self.clip_param = clip_param
         self.num_learning_epochs = num_learning_epochs
         self.num_mini_batches = num_mini_batches
@@ -83,6 +59,7 @@ class HIMPPO:
         self.use_clipped_value_loss = use_clipped_value_loss
 
     def init_storage(self, num_envs, num_transitions_per_env, actor_obs_shape, critic_obs_shape, action_shape):
+        # 初始化经验回放池
         self.storage = HIMRolloutStorage(num_envs, num_transitions_per_env, actor_obs_shape, critic_obs_shape, action_shape, self.device)
 
     def test_mode(self):
@@ -92,64 +69,80 @@ class HIMPPO:
         self.actor_critic.train()
 
     def act(self, obs, critic_obs):
-        # Compute the actions and values
+        """
+        在环境中执行一步交互，同时处理原始观测和镜像观测。
+        """
+        # --- 1. 处理原始数据 ---
+        # 计算动作分布、价值
         self.transition.actions = self.actor_critic.act(obs).detach()
         self.transition.values = self.actor_critic.evaluate(critic_obs).detach()
         self.transition.actions_log_prob = self.actor_critic.get_actions_log_prob(self.transition.actions).detach()
         self.transition.action_mean = self.actor_critic.action_mean.detach()
         self.transition.action_sigma = self.actor_critic.action_std.detach()
-        # need to record obs and critic_obs before env.step()
+        # 记录观测值
         self.transition.observations = obs
         self.transition.critic_observations = critic_obs
         
+        # --- 2. 处理镜像数据 (Symmetry) ---
+        # [关键步骤]：对观测进行镜像翻转 (左变右，右变左)
         obs_sym = self.flip_g1_actor_obs(obs)
         critic_obs_sym = self.flip_g1_critic_obs(critic_obs)
+        
+        # 使用相同的网络对镜像观测进行推理
         self.transition_sym.actions = self.actor_critic.act(obs_sym).detach()
         self.transition_sym.values = self.actor_critic.evaluate(critic_obs_sym).detach()
         self.transition_sym.actions_log_prob = self.actor_critic.get_actions_log_prob(self.transition_sym.actions).detach()
         self.transition_sym.action_mean = self.actor_critic.action_mean.detach()
         self.transition_sym.action_sigma = self.actor_critic.action_std.detach()
-        # need to record obs and critic_obs before env.step()
+        # 记录镜像观测
         self.transition_sym.observations = obs_sym
         self.transition_sym.critic_observations = critic_obs_sym
+        
+        # 返回给环境执行的动作 (必须是原始观测产生的动作)
         return self.transition.actions
     
     def process_env_step(self, rewards, dones, infos, next_critic_obs):
+        """处理环境反馈的奖励和结束信号"""
+        # 记录原始数据的奖励
         self.transition.next_critic_observations = next_critic_obs.clone()
         self.transition.rewards = rewards.clone()
         self.transition.dones = dones
         
+        # 记录镜像数据的奖励 (奖励是对称的，假设环境也是对称的)
         next_critic_obs_sym = self.flip_g1_critic_obs(next_critic_obs)
         self.transition_sym.next_critic_observations = next_critic_obs_sym.clone()
-        self.transition_sym.rewards = rewards.clone()
+        self.transition_sym.rewards = rewards.clone() # 镜像状态获得相同的奖励
         self.transition_sym.dones = dones
-        # Bootstrapping on time outs
+        
+        # 处理超时 (Time out) 的情况，进行自举 (Bootstrapping)
         if 'time_outs' in infos:
             self.transition.rewards += self.gamma * torch.squeeze(self.transition.values * infos['time_outs'].unsqueeze(1).to(self.device), 1)
             self.transition_sym.rewards += self.gamma * torch.squeeze(self.transition_sym.values * infos['time_outs'].unsqueeze(1).to(self.device), 1)
-        # Record the transition
+        
+        # 将两份数据都存入 Buffer，实现数据增强 (Data Augmentation)
         self.storage.add_transitions(self.transition)
         self.storage.add_transitions(self.transition_sym)
+        
         self.transition.clear()
         self.transition_sym.clear()
         self.actor_critic.reset(dones)
     
     def compute_returns(self, last_critic_obs):
+        # 计算优势函数 (GAE)
         last_values= self.actor_critic.evaluate(last_critic_obs).detach()
         self.storage.compute_returns(last_values, self.gamma, self.lam)
 
     def update(self):
-        mean_value_loss = 0
-        mean_surrogate_loss = 0
-        mean_estimation_loss = 0
-        mean_swap_loss = 0
-        mean_actor_sym_loss = 0
-        mean_critic_sym_loss = 0
+        """PPO 更新主循环"""
+        # ... (初始化统计变量) ...
         
+        # 生成 mini-batch
         generator = self.storage.mini_batch_generator(self.num_mini_batches, self.num_learning_epochs)
 
         for obs_batch, critic_obs_batch, actions_batch, next_critic_obs_batch, target_values_batch, advantages_batch, returns_batch, old_actions_log_prob_batch, \
             old_mu_batch, old_sigma_batch in generator:
+                
+                # 1. 前向传播
                 self.actor_critic.act(obs_batch)
                 actions_log_prob_batch = self.actor_critic.get_actions_log_prob(actions_batch)
                 value_batch = self.actor_critic.evaluate(critic_obs_batch)
@@ -157,297 +150,120 @@ class HIMPPO:
                 sigma_batch = self.actor_critic.action_std
                 entropy_batch = self.actor_critic.entropy
 
-                # KL
+                # 2. KL 散度计算与自适应学习率调整
                 if self.desired_kl != None and self.schedule == 'adaptive':
-                    with torch.inference_mode():
-                        kl = torch.sum(
-                            torch.log(sigma_batch / old_sigma_batch + 1.e-5) + (torch.square(old_sigma_batch) + torch.square(old_mu_batch - mu_batch)) / (2.0 * torch.square(sigma_batch)) - 0.5, axis=-1)
-                        kl_mean = torch.mean(kl)
+                    # ... (标准 PPO 的 KL 调整逻辑) ...
 
-                        if kl_mean > self.desired_kl * 2.0:
-                            self.learning_rate = max(1e-5, self.learning_rate / 1.5)
-                        elif kl_mean < self.desired_kl / 2.0 and kl_mean > 0.0:
-                            self.learning_rate = min(1e-2, self.learning_rate * 1.5)
-                        
-                        for param_group in self.optimizer.param_groups:
-                            param_group['lr'] = self.learning_rate
-
-                #Estimator Update
+                # 3. Estimator (估计器) 更新
+                # 这是 Homie 论文中提到的 Teacher-Student 架构的一部分，或者是 RMA 架构
                 if self.use_flip:
                     flipped_obs_batch = self.flip_g1_actor_obs(obs_batch)
                     flipped_next_critic_obs_batch = self.flip_g1_critic_obs(next_critic_obs_batch)
+                    # 拼接原始数据和翻转数据一起训练估计器
                     estimator_update_obs_batch =  torch.cat((obs_batch, flipped_obs_batch), dim=0)
                     estimator_update_next_critic_obs_batch = torch.cat((next_critic_obs_batch, flipped_next_critic_obs_batch), dim=0)
                 else:
                     estimator_update_obs_batch = obs_batch
                     estimator_update_next_critic_obs_batch = next_critic_obs_batch
+                
+                # 更新 Estimator 网络
                 estimation_loss, swap_loss = self.actor_critic.update_estimator(estimator_update_obs_batch, estimator_update_next_critic_obs_batch, lr=self.learning_rate)
                 
-                # Surrogate loss
-                ratio = torch.exp(actions_log_prob_batch - torch.squeeze(old_actions_log_prob_batch))
-                surrogate = -torch.squeeze(advantages_batch) * ratio
-                surrogate_clipped = -torch.squeeze(advantages_batch) * torch.clamp(ratio, 1.0 - self.clip_param, 1.0 + self.clip_param)
-                surrogate_loss = torch.max(surrogate, surrogate_clipped).mean()
+                # 4. 计算 PPO 损失 (Surrogate Loss)
+                # ... (标准的 PPO Clip Loss 计算) ...
 
-                # Value function loss
-                if self.use_clipped_value_loss:
-                    value_clipped = target_values_batch + (value_batch - target_values_batch).clamp(-self.clip_param, self.clip_param)
-                    value_losses = (value_batch - returns_batch).pow(2)
-                    value_losses_clipped = (value_clipped - returns_batch).pow(2)
-                    value_loss = torch.max(value_losses, value_losses_clipped).mean()
-                else:
-                    value_loss = (returns_batch - value_batch).pow(2).mean()
-                    
+                # 5. 计算 Value Loss
+                # ... (标准的 Value Loss 计算) ...
+                
+                # 6. [核心] 计算对称性损失 (Symmetry Loss)
                 if self.use_flip:
                     flipped_critic_obs_batch = self.flip_g1_critic_obs(critic_obs_batch)
-                    actor_sym_loss = self.symmetry_scale * torch.mean(torch.sum(torch.square(self.actor_critic.act_inference(flipped_obs_batch) - self.flip_g1_actions(self.actor_critic.act_inference(obs_batch))), dim=-1))
-                    critic_sym_loss = self.symmetry_scale * torch.mean(torch.square(self.actor_critic.evaluate(flipped_critic_obs_batch) - self.actor_critic.evaluate(critic_obs_batch).detach()))
+                    flipped_obs_batch = self.flip_g1_actor_obs(obs_batch) # 注意：这里重复计算了一次，可以优化
+                    
+                    # Actor 对称性损失：
+                    # Loss = || Network(Flipped_Obs) - Flip(Network(Obs)) ||^2
+                    # 意思是：输入翻转后的状态，网络输出的动作应该等于原始输出动作的翻转
+                    actor_sym_loss = self.symmetry_scale * torch.mean(torch.sum(torch.square(
+                        self.actor_critic.act_inference(flipped_obs_batch) - 
+                        self.flip_g1_actions(self.actor_critic.act_inference(obs_batch))
+                    ), dim=-1))
+                    
+                    # Critic 对称性损失：
+                    # Loss = || Value(Flipped_Obs) - Value(Obs) ||^2
+                    # 意思是：左右镜像的状态，其价值应该是相等的
+                    critic_sym_loss = self.symmetry_scale * torch.mean(torch.square(
+                        self.actor_critic.evaluate(flipped_critic_obs_batch) - 
+                        self.actor_critic.evaluate(critic_obs_batch).detach()
+                    ))
+                    
+                    # 总损失 = PPO损失 + Value损失 - 熵 + 对称损失
                     loss = surrogate_loss + self.value_loss_coef * value_loss - self.entropy_coef * entropy_batch.mean() + actor_sym_loss + critic_sym_loss
                 else:
                     loss = surrogate_loss + self.value_loss_coef * value_loss - self.entropy_coef * entropy_batch.mean()
 
-                # Gradient step
+                # 7. 反向传播与优化
                 self.optimizer.zero_grad()
                 loss.backward()
                 nn.utils.clip_grad_norm_(self.actor_critic.parameters(), self.max_grad_norm)
                 self.optimizer.step()
 
-                mean_value_loss += value_loss.item()
-                mean_surrogate_loss += surrogate_loss.item()
-                mean_estimation_loss += estimation_loss
-                mean_swap_loss += swap_loss
-                if self.use_flip:
-                    mean_actor_sym_loss += actor_sym_loss.item()
-                    mean_critic_sym_loss += critic_sym_loss.item()
+                # ... (统计数据记录) ...
 
-        num_updates = self.num_learning_epochs * self.num_mini_batches
-        mean_value_loss /= num_updates
-        mean_surrogate_loss /= num_updates
-        mean_estimation_loss /= num_updates
-        mean_swap_loss /= num_updates
-        if self.use_flip:
-            mean_actor_sym_loss /= num_updates
-            mean_critic_sym_loss /= num_updates
-        self.storage.clear()
+        # ... (清理与返回) ...
 
-        if self.use_flip:
-            return mean_value_loss, mean_surrogate_loss, mean_estimation_loss, mean_swap_loss, mean_actor_sym_loss, mean_critic_sym_loss
-        else:
-            return mean_value_loss, mean_surrogate_loss, estimation_loss, swap_loss, 0, 0
+    # ==========================================
+    # 辅助函数：状态和动作的镜像翻转
+    # ==========================================
     
     def flip_g1_actor_obs(self, obs):
+        """
+        翻转 Actor 的观测向量 (针对 Unitree G1 机器人)
+        逻辑：交换左右关节的位置/速度，翻转 Y 轴和 Yaw 轴的指令/角速度。
+        """
+        # 取出本体感知数据 (Proprioception)
         proprioceptive_obs = torch.clone(obs[:, :self.actor_critic.num_one_step_obs * self.actor_critic.actor_history_length])
         proprioceptive_obs = proprioceptive_obs.view(-1, self.actor_critic.actor_history_length, self.actor_critic.num_one_step_obs)
         
         flipped_proprioceptive_obs = torch.zeros_like(proprioceptive_obs)
+        
+        # --- 1. 翻转指令和基座状态 ---
+        # x 不变, y 取反, yaw 取反
         flipped_proprioceptive_obs[:, :, 0] =  proprioceptive_obs[:, :, 0] # x command
         flipped_proprioceptive_obs[:, :, 1] = -proprioceptive_obs[:, :, 1] # y command
         flipped_proprioceptive_obs[:, :, 2] = -proprioceptive_obs[:, :, 2] # yaw command
-        flipped_proprioceptive_obs[:, :, 3] =  proprioceptive_obs[:, :, 3] # height command
-        flipped_proprioceptive_obs[:, :, 4] = -proprioceptive_obs[:, :, 4] # base ang vel roll
-        flipped_proprioceptive_obs[:, :, 5] =  proprioceptive_obs[:, :, 5] # base ang vel pitch
-        flipped_proprioceptive_obs[:, :, 6] = -proprioceptive_obs[:, :, 6] # base ang vel yaw
-        flipped_proprioceptive_obs[:, :, 7] =  proprioceptive_obs[:, :, 7] # projected gravity x
-        flipped_proprioceptive_obs[:, :, 8] = -proprioceptive_obs[:, :, 8] # projected gravity y
-        flipped_proprioceptive_obs[:, :, 9] =  proprioceptive_obs[:, :, 9] # projected gravity z
+        # ... (Roll 取反, Pitch 不变, Yaw 取反) ...
         
-        # joint pos
-        flipped_proprioceptive_obs[:, :, 10] =  proprioceptive_obs[:, :, 16] # lower
-        flipped_proprioceptive_obs[:, :, 11] = -proprioceptive_obs[:, :, 17]
-        flipped_proprioceptive_obs[:, :, 12] = -proprioceptive_obs[:, :, 18]
-        flipped_proprioceptive_obs[:, :, 13] =  proprioceptive_obs[:, :, 19]
-        flipped_proprioceptive_obs[:, :, 14] =  proprioceptive_obs[:, :, 20]
-        flipped_proprioceptive_obs[:, :, 15] = -proprioceptive_obs[:, :, 21]
-        flipped_proprioceptive_obs[:, :, 16] =  proprioceptive_obs[:, :, 10]
-        flipped_proprioceptive_obs[:, :, 17] = -proprioceptive_obs[:, :, 11]
-        flipped_proprioceptive_obs[:, :, 18] = -proprioceptive_obs[:, :, 12]
-        flipped_proprioceptive_obs[:, :, 19] =  proprioceptive_obs[:, :, 13]
-        flipped_proprioceptive_obs[:, :, 20] =  proprioceptive_obs[:, :, 14]
-        flipped_proprioceptive_obs[:, :, 21] = -proprioceptive_obs[:, :, 15]
-        
-        flipped_proprioceptive_obs[:, :, 22] =  -proprioceptive_obs[:, :, 22] # waist
-        
-        flipped_proprioceptive_obs[:, :, 23] =  proprioceptive_obs[:, :, 30] # left shoulder
-        flipped_proprioceptive_obs[:, :, 24] = -proprioceptive_obs[:, :, 31]
-        flipped_proprioceptive_obs[:, :, 25] = -proprioceptive_obs[:, :, 32]
-        flipped_proprioceptive_obs[:, :, 26] =  proprioceptive_obs[:, :, 33] # elbow
-        flipped_proprioceptive_obs[:, :, 27] = -proprioceptive_obs[:, :, 34] # wrist
-        flipped_proprioceptive_obs[:, :, 28] =  proprioceptive_obs[:, :, 35]
-        flipped_proprioceptive_obs[:, :, 29] = -proprioceptive_obs[:, :, 36]
+        # --- 2. 交换左右关节位置 (Joint Pos) ---
+        # 假设 obs 索引 10~15 是左腿，16~21 是右腿 (或相反，需对照 G1 定义)
+        # 这里代码似乎是：16~21(右) -> 10~15(左)，10~15(左) -> 16~21(右)
+        # 同时注意某些关节需要取反（如 Roll 关节）
+        flipped_proprioceptive_obs[:, :, 10] =  proprioceptive_obs[:, :, 16] # Right Hip Pitch -> Left Hip Pitch
+        flipped_proprioceptive_obs[:, :, 11] = -proprioceptive_obs[:, :, 17] # Right Hip Roll -> -Left Hip Roll (镜像关系)
+        # ... (其余关节类似处理) ...
 
-        
-        flipped_proprioceptive_obs[:, :, 30] =  proprioceptive_obs[:, :, 23] # right shoulder
-        flipped_proprioceptive_obs[:, :, 31] = -proprioceptive_obs[:, :, 24]
-        flipped_proprioceptive_obs[:, :, 32] = -proprioceptive_obs[:, :, 25]
-        flipped_proprioceptive_obs[:, :, 33] =  proprioceptive_obs[:, :, 26] # elbow
-        flipped_proprioceptive_obs[:, :, 34] = -proprioceptive_obs[:, :, 27] # wrist
-        flipped_proprioceptive_obs[:, :, 35] =  proprioceptive_obs[:, :, 28]
-        flipped_proprioceptive_obs[:, :, 36] = -proprioceptive_obs[:, :, 29]
-        
-        # joint vel
-        flipped_proprioceptive_obs[:, :, 10+27] =  proprioceptive_obs[:, :, 16+27] # lower
-        flipped_proprioceptive_obs[:, :, 11+27] = -proprioceptive_obs[:, :, 17+27]
-        flipped_proprioceptive_obs[:, :, 12+27] = -proprioceptive_obs[:, :, 18+27]
-        flipped_proprioceptive_obs[:, :, 13+27] =  proprioceptive_obs[:, :, 19+27]
-        flipped_proprioceptive_obs[:, :, 14+27] =  proprioceptive_obs[:, :, 20+27]
-        flipped_proprioceptive_obs[:, :, 15+27] = -proprioceptive_obs[:, :, 21+27]
-        flipped_proprioceptive_obs[:, :, 16+27] =  proprioceptive_obs[:, :, 10+27]
-        flipped_proprioceptive_obs[:, :, 17+27] = -proprioceptive_obs[:, :, 11+27]
-        flipped_proprioceptive_obs[:, :, 18+27] = -proprioceptive_obs[:, :, 12+27]
-        flipped_proprioceptive_obs[:, :, 19+27] =  proprioceptive_obs[:, :, 13+27]
-        flipped_proprioceptive_obs[:, :, 20+27] =  proprioceptive_obs[:, :, 14+27]
-        flipped_proprioceptive_obs[:, :, 21+27] = -proprioceptive_obs[:, :, 15+27]
-        
-        flipped_proprioceptive_obs[:, :, 22+27] =  -proprioceptive_obs[:, :, 22+27] # waist
-        
-        flipped_proprioceptive_obs[:, :, 23+27] =  proprioceptive_obs[:, :, 30+27] # left shoulder
-        flipped_proprioceptive_obs[:, :, 24+27] = -proprioceptive_obs[:, :, 31+27]
-        flipped_proprioceptive_obs[:, :, 25+27] = -proprioceptive_obs[:, :, 32+27]
-        flipped_proprioceptive_obs[:, :, 26+27] =  proprioceptive_obs[:, :, 33+27] # elbow
-        flipped_proprioceptive_obs[:, :, 27+27] = -proprioceptive_obs[:, :, 34+27] # wrist
-        flipped_proprioceptive_obs[:, :, 28+27] =  proprioceptive_obs[:, :, 35+27]
-        flipped_proprioceptive_obs[:, :, 29+27] = -proprioceptive_obs[:, :, 36+27]
+        # --- 3. 交换左右关节速度 (Joint Vel) ---
+        # 逻辑同上，只是索引偏移了 27 (关节数)
+        # ...
 
-        
-        flipped_proprioceptive_obs[:, :, 30+27] =  proprioceptive_obs[:, :, 23+27] # right shoulder
-        flipped_proprioceptive_obs[:, :, 31+27] = -proprioceptive_obs[:, :, 24+27]
-        flipped_proprioceptive_obs[:, :, 32+27] = -proprioceptive_obs[:, :, 25+27]
-        flipped_proprioceptive_obs[:, :, 33+27] =  proprioceptive_obs[:, :, 26+27] # elbow
-        flipped_proprioceptive_obs[:, :, 34+27] = -proprioceptive_obs[:, :, 27+27] # wrist
-        flipped_proprioceptive_obs[:, :, 35+27] =  proprioceptive_obs[:, :, 28+27]
-        flipped_proprioceptive_obs[:, :, 36+27] = -proprioceptive_obs[:, :, 29+27]
-        
-        # joint target
-        flipped_proprioceptive_obs[:, :, 10+54] =  proprioceptive_obs[:, :, 16+54] # lower
-        flipped_proprioceptive_obs[:, :, 11+54] = -proprioceptive_obs[:, :, 17+54]
-        flipped_proprioceptive_obs[:, :, 12+54] = -proprioceptive_obs[:, :, 18+54]
-        flipped_proprioceptive_obs[:, :, 13+54] =  proprioceptive_obs[:, :, 19+54]
-        flipped_proprioceptive_obs[:, :, 14+54] =  proprioceptive_obs[:, :, 20+54]
-        flipped_proprioceptive_obs[:, :, 15+54] = -proprioceptive_obs[:, :, 21+54]
-        flipped_proprioceptive_obs[:, :, 16+54] =  proprioceptive_obs[:, :, 10+54]
-        flipped_proprioceptive_obs[:, :, 17+54] = -proprioceptive_obs[:, :, 11+54]
-        flipped_proprioceptive_obs[:, :, 18+54] = -proprioceptive_obs[:, :, 12+54]
-        flipped_proprioceptive_obs[:, :, 19+54] =  proprioceptive_obs[:, :, 13+54]
-        flipped_proprioceptive_obs[:, :, 20+54] =  proprioceptive_obs[:, :, 14+54]
-        flipped_proprioceptive_obs[:, :, 21+54] = -proprioceptive_obs[:, :, 15+54]
-
-        return flipped_proprioceptive_obs.view(-1, self.actor_critic.num_one_step_obs * self.actor_critic.actor_history_length).detach()                                                                                                                                                                                                                                             
+        return flipped_proprioceptive_obs.view(-1, self.actor_critic.num_one_step_obs * self.actor_critic.actor_history_length).detach()
     
     def flip_g1_critic_obs(self, critic_obs):
-        proprioceptive_obs = torch.clone(critic_obs[:, :self.actor_critic.num_one_step_critic_obs * self.actor_critic.critic_history_length])
-        proprioceptive_obs = proprioceptive_obs.view(-1, self.actor_critic.critic_history_length, self.actor_critic.num_one_step_critic_obs)
-        flipped_proprioceptive_obs = torch.zeros_like(proprioceptive_obs)
-        
-        flipped_proprioceptive_obs = torch.zeros_like(proprioceptive_obs)
-        flipped_proprioceptive_obs[:, :, 0] =  proprioceptive_obs[:, :, 0] # x command
-        flipped_proprioceptive_obs[:, :, 1] = -proprioceptive_obs[:, :, 1] # y command
-        flipped_proprioceptive_obs[:, :, 2] = -proprioceptive_obs[:, :, 2] # yaw command
-        flipped_proprioceptive_obs[:, :, 3] =  proprioceptive_obs[:, :, 3] # height command
-        flipped_proprioceptive_obs[:, :, 4] = -proprioceptive_obs[:, :, 4] # base ang vel roll
-        flipped_proprioceptive_obs[:, :, 5] =  proprioceptive_obs[:, :, 5] # base ang vel pitch
-        flipped_proprioceptive_obs[:, :, 6] = -proprioceptive_obs[:, :, 6] # base ang vel yaw
-        flipped_proprioceptive_obs[:, :, 7] =  proprioceptive_obs[:, :, 7] # projected gravity x
-        flipped_proprioceptive_obs[:, :, 8] = -proprioceptive_obs[:, :, 8] # projected gravity y
-        flipped_proprioceptive_obs[:, :, 9] =  proprioceptive_obs[:, :, 9] # projected gravity z
-        
-        # joint pos
-        flipped_proprioceptive_obs[:, :, 10] =  proprioceptive_obs[:, :, 16] # lower
-        flipped_proprioceptive_obs[:, :, 11] = -proprioceptive_obs[:, :, 17]
-        flipped_proprioceptive_obs[:, :, 12] = -proprioceptive_obs[:, :, 18]
-        flipped_proprioceptive_obs[:, :, 13] =  proprioceptive_obs[:, :, 19]
-        flipped_proprioceptive_obs[:, :, 14] =  proprioceptive_obs[:, :, 20]
-        flipped_proprioceptive_obs[:, :, 15] = -proprioceptive_obs[:, :, 21]
-        flipped_proprioceptive_obs[:, :, 16] =  proprioceptive_obs[:, :, 10]
-        flipped_proprioceptive_obs[:, :, 17] = -proprioceptive_obs[:, :, 11]
-        flipped_proprioceptive_obs[:, :, 18] = -proprioceptive_obs[:, :, 12]
-        flipped_proprioceptive_obs[:, :, 19] =  proprioceptive_obs[:, :, 13]
-        flipped_proprioceptive_obs[:, :, 20] =  proprioceptive_obs[:, :, 14]
-        flipped_proprioceptive_obs[:, :, 21] = -proprioceptive_obs[:, :, 15]
-        
-        flipped_proprioceptive_obs[:, :, 22] =  -proprioceptive_obs[:, :, 22] # waist
-        
-        flipped_proprioceptive_obs[:, :, 23] =  proprioceptive_obs[:, :, 30] # left shoulder
-        flipped_proprioceptive_obs[:, :, 24] = -proprioceptive_obs[:, :, 31]
-        flipped_proprioceptive_obs[:, :, 25] = -proprioceptive_obs[:, :, 32]
-        flipped_proprioceptive_obs[:, :, 26] =  proprioceptive_obs[:, :, 33] # elbow
-        flipped_proprioceptive_obs[:, :, 27] = -proprioceptive_obs[:, :, 34] # wrist
-        flipped_proprioceptive_obs[:, :, 28] =  proprioceptive_obs[:, :, 35]
-        flipped_proprioceptive_obs[:, :, 29] = -proprioceptive_obs[:, :, 36]
-
-        
-        flipped_proprioceptive_obs[:, :, 30] =  proprioceptive_obs[:, :, 23] # right shoulder
-        flipped_proprioceptive_obs[:, :, 31] = -proprioceptive_obs[:, :, 24]
-        flipped_proprioceptive_obs[:, :, 32] = -proprioceptive_obs[:, :, 25]
-        flipped_proprioceptive_obs[:, :, 33] =  proprioceptive_obs[:, :, 26] # elbow
-        flipped_proprioceptive_obs[:, :, 34] = -proprioceptive_obs[:, :, 27] # wrist
-        flipped_proprioceptive_obs[:, :, 35] =  proprioceptive_obs[:, :, 28]
-        flipped_proprioceptive_obs[:, :, 36] = -proprioceptive_obs[:, :, 29]
-        
-        # joint vel
-        flipped_proprioceptive_obs[:, :, 10+27] =  proprioceptive_obs[:, :, 16+27] # lower
-        flipped_proprioceptive_obs[:, :, 11+27] = -proprioceptive_obs[:, :, 17+27]
-        flipped_proprioceptive_obs[:, :, 12+27] = -proprioceptive_obs[:, :, 18+27]
-        flipped_proprioceptive_obs[:, :, 13+27] =  proprioceptive_obs[:, :, 19+27]
-        flipped_proprioceptive_obs[:, :, 14+27] =  proprioceptive_obs[:, :, 20+27]
-        flipped_proprioceptive_obs[:, :, 15+27] = -proprioceptive_obs[:, :, 21+27]
-        flipped_proprioceptive_obs[:, :, 16+27] =  proprioceptive_obs[:, :, 10+27]
-        flipped_proprioceptive_obs[:, :, 17+27] = -proprioceptive_obs[:, :, 11+27]
-        flipped_proprioceptive_obs[:, :, 18+27] = -proprioceptive_obs[:, :, 12+27]
-        flipped_proprioceptive_obs[:, :, 19+27] =  proprioceptive_obs[:, :, 13+27]
-        flipped_proprioceptive_obs[:, :, 20+27] =  proprioceptive_obs[:, :, 14+27]
-        flipped_proprioceptive_obs[:, :, 21+27] = -proprioceptive_obs[:, :, 15+27]
-        
-        flipped_proprioceptive_obs[:, :, 22+27] =  -proprioceptive_obs[:, :, 22+27] # waist
-        
-        flipped_proprioceptive_obs[:, :, 23+27] =  proprioceptive_obs[:, :, 30+27] # left shoulder
-        flipped_proprioceptive_obs[:, :, 24+27] = -proprioceptive_obs[:, :, 31+27]
-        flipped_proprioceptive_obs[:, :, 25+27] = -proprioceptive_obs[:, :, 32+27]
-        flipped_proprioceptive_obs[:, :, 26+27] =  proprioceptive_obs[:, :, 33+27] # elbow
-        flipped_proprioceptive_obs[:, :, 27+27] = -proprioceptive_obs[:, :, 34+27] # wrist
-        flipped_proprioceptive_obs[:, :, 28+27] =  proprioceptive_obs[:, :, 35+27]
-        flipped_proprioceptive_obs[:, :, 29+27] = -proprioceptive_obs[:, :, 36+27]
-
-        
-        flipped_proprioceptive_obs[:, :, 30+27] =  proprioceptive_obs[:, :, 23+27] # right shoulder
-        flipped_proprioceptive_obs[:, :, 31+27] = -proprioceptive_obs[:, :, 24+27]
-        flipped_proprioceptive_obs[:, :, 32+27] = -proprioceptive_obs[:, :, 25+27]
-        flipped_proprioceptive_obs[:, :, 33+27] =  proprioceptive_obs[:, :, 26+27] # elbow
-        flipped_proprioceptive_obs[:, :, 34+27] = -proprioceptive_obs[:, :, 27+27] # wrist
-        flipped_proprioceptive_obs[:, :, 35+27] =  proprioceptive_obs[:, :, 28+27]
-        flipped_proprioceptive_obs[:, :, 36+27] = -proprioceptive_obs[:, :, 29+27]
-        
-        # joint target
-        flipped_proprioceptive_obs[:, :, 10+54] =  proprioceptive_obs[:, :, 16+54] # lower
-        flipped_proprioceptive_obs[:, :, 11+54] = -proprioceptive_obs[:, :, 17+54]
-        flipped_proprioceptive_obs[:, :, 12+54] = -proprioceptive_obs[:, :, 18+54]
-        flipped_proprioceptive_obs[:, :, 13+54] =  proprioceptive_obs[:, :, 19+54]
-        flipped_proprioceptive_obs[:, :, 14+54] =  proprioceptive_obs[:, :, 20+54]
-        flipped_proprioceptive_obs[:, :, 15+54] = -proprioceptive_obs[:, :, 21+54]
-        flipped_proprioceptive_obs[:, :, 16+54] =  proprioceptive_obs[:, :, 10+54]
-        flipped_proprioceptive_obs[:, :, 17+54] = -proprioceptive_obs[:, :, 11+54]
-        flipped_proprioceptive_obs[:, :, 18+54] = -proprioceptive_obs[:, :, 12+54]
-        flipped_proprioceptive_obs[:, :, 19+54] =  proprioceptive_obs[:, :, 13+54]
-        flipped_proprioceptive_obs[:, :, 20+54] =  proprioceptive_obs[:, :, 14+54]
-        flipped_proprioceptive_obs[:, :, 21+54] = -proprioceptive_obs[:, :, 15+54]
-        
-        flipped_proprioceptive_obs[:, :, 22+54] =  proprioceptive_obs[:, :, 22+54] # base lin vel x
-        flipped_proprioceptive_obs[:, :, 23+54] = -proprioceptive_obs[:, :, 23+54] # base lin vel y
-        flipped_proprioceptive_obs[:, :, 24+54] =  proprioceptive_obs[:, :, 24+54] # base lin vel z
-
-        return flipped_proprioceptive_obs.view(-1, self.actor_critic.num_one_step_critic_obs * self.actor_critic.critic_history_length).detach()
+        """翻转 Critic 的观测向量 (通常包含特权信息，逻辑同上)"""
+        # ... (代码逻辑与 flip_g1_actor_obs 类似) ...
+        return flipped_proprioceptive_obs.view(...).detach()
     
     def flip_g1_actions(self, actions):
+        """
+        翻转动作向量
+        输入：[左腿动作, 右腿动作]
+        输出：[右腿动作(经过符号调整), 左腿动作(经过符号调整)]
+        """
         flipped_actions = torch.zeros_like(actions)
-        flipped_actions[:,  0] =  actions[:, 6]        # 0 "left_hip_pitch_joint",
-        flipped_actions[:,  1] = -actions[:, 7]        # 1 "left_hip_roll_joint",
-        flipped_actions[:,  2] = -actions[:, 8]        # 2 "left_hip_yaw_joint",
-        flipped_actions[:,  3] =  actions[:, 9]        # 3 "left_knee_joint",
-        flipped_actions[:,  4] =  actions[:, 10]       # 4 "left_ankle_pitch_joint",
-        flipped_actions[:,  5] = -actions[:, 11]       # 5 "left_ankle_roll_joint",
-        flipped_actions[:,  6] =  actions[:, 0]        # 6 "right_hip_pitch_joint",
-        flipped_actions[:,  7] = -actions[:, 1]        # 7 "right_hip_roll_joint",
-        flipped_actions[:,  8] = -actions[:, 2]        # 8 "right_hip_yaw_joint",
-        flipped_actions[:,  9] =  actions[:, 3]        # 9 "right_knee_joint",
-        flipped_actions[:, 10] =  actions[:, 4]        # 10 "right_ankle_pitch_joint",
-        flipped_actions[:, 11] = -actions[:, 5]        # 11 "right_ankle_roll_joint",
+        # G1 动作顺序：0-5 右腿? 6-11 左腿? (需核对 URDF)
+        # 这里将 index 6(左) 赋值给 index 0(右)，说明交换了左右
+        # 并且某些自由度（如 Roll, Yaw）取了负号，符合镜像原理
+        flipped_actions[:,  0] =  actions[:, 6]        # Left Hip Pitch -> Right Hip Pitch
+        flipped_actions[:,  1] = -actions[:, 7]        # Left Hip Roll -> -Right Hip Roll
+        flipped_actions[:,  2] = -actions[:, 8]        # Left Hip Yaw -> -Right Hip Yaw
+        # ...
         return flipped_actions.detach()
